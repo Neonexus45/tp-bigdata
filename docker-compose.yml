@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  spark-lakehouse:
+    build: .
+    container_name: us-accidents-lakehouse
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    environment:
+      - SPARK_LOCAL_IP=0.0.0.0
+      - PYTHONPATH=/app/src
+    command: ./run-pipeline.sh
