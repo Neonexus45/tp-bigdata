@@ -1,227 +1,238 @@
 import argparse
 import sys
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import lit, col
 from datetime import datetime
 import os
+from typing import List, Optional
+
+from src.core.config import Config
+from src.core.logger import get_logger
+from src.core.spark_manager import SparkManager
+from src.utils.helpers import (
+    get_selected_columns,
+    filter_available_columns,
+    log_missing_columns,
+    get_partition_path,
+    format_execution_time
+)
 
 class USAccidentsFeeder:
-    def __init__(self):
-        print("FEEDER: Initialisation du Feeder avec Spark Session")
+    """US Accidents Bronze Layer Feeder with incremental data simulation."""
+    
+    def __init__(self) -> None:
+        """Initialize the feeder with core classes."""
+        self.config = Config()
+        self.logger = get_logger(__name__)
+        self.spark_manager = SparkManager()
         
-        self.spark = SparkSession.builder \
-            .appName("USAccidents-BronzeFeeder") \
-            .master("local[*]") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .config("spark.driver.memory", "4g") \
-            .config("spark.executor.memory", "4g") \
-            .getOrCreate()
+        self.logger.info("Initializing US Accidents Feeder")
         
-        self.spark.sparkContext.setLogLevel("WARN")
+        self.selected_columns = get_selected_columns()
         
-        print("FEEDER: Configuration des chemins")
-        # Chemins de configuration - MODIFIE pour sample.csv
-        self.input_path = "/app/data/sample.csv"
-        self.bronze_output_path = "/app/output/bronze"
+        self._partitions_cache: Optional[List] = None
         
-        print("FEEDER: Definition des colonnes a selectionner")
-        # Colonnes à sélectionner - NOUVEAU
-        self.selected_columns = [
-            "ID", "Source", "Severity", "Start_Time", "End_Time",
-            "Start_Lat", "Start_Lng", "City", "County", "State", "Zipcode",
-            "Timezone", "Temperature(F)", "Humidity(%)", "Pressure(in)",
-            "Visibility(mi)", "Wind_Direction", "Wind_Speed(mph)", 
-            "Precipitation(in)", "Weather_Condition", "Bump", "Crossing",
-            "Give_Way", "Junction", "No_Exit", "Railway", "Roundabout",
-            "Station", "Stop", "Traffic_Calming", "Traffic_Signal", "Turning_Loop"
-        ]
-        
-        # Variables de classe pour les partitions (simulation d'un cache)
-        self._partitions_cache = None
-        
-        print("FEEDER: Spark Session initialise avec succes")
+        self.logger.info("US Accidents Feeder initialized successfully")
 
     def load_source_data(self):
-        print(f"FEEDER: Chargement des donnees source depuis {self.input_path}")
+        """Load source data from CSV file with column validation.
+        
+        Returns:
+            DataFrame: Loaded and filtered DataFrame
+        """
+        self.logger.info(f"Loading source data from {self.config.input_path}")
         
         try:
-            print("FEEDER: Lecture du CSV complet")
-            # Lecture du CSV complet
-            df_full = self.spark.read \
-                .option("header", "true") \
-                .option("inferSchema", "true") \
-                .option("multiline", "true") \
-                .option("escape", '"') \
-                .csv(self.input_path)
             
-            # Vérification des colonnes disponibles
+            df_full = self.spark_manager.read_csv(self.config.input_path)
+            
             available_columns = df_full.columns
-            print(f"FEEDER: Colonnes disponibles: {len(available_columns)}")
-            print(f"FEEDER: Liste des colonnes: {available_columns}")
+            self.logger.info(f"Available columns: {len(available_columns)}")
+            self.logger.debug(f"Column list: {available_columns}")
             
-            # Sélection des colonnes désirées
-            missing_columns = [col for col in self.selected_columns if col not in available_columns]
+            missing_columns = log_missing_columns(self.selected_columns, available_columns)
             if missing_columns:
-                print(f"FEEDER: ATTENTION - Colonnes manquantes: {missing_columns}")
-                # Filtrer les colonnes manquantes
-                self.selected_columns = [col for col in self.selected_columns if col in available_columns]
+                self.logger.warning(f"Missing columns: {missing_columns}")
+                
+            self.selected_columns = filter_available_columns(df_full, self.selected_columns)
             
-            print("FEEDER: Selection des colonnes desirees")
-            # Sélection finale
+            self.logger.info("Selecting desired columns")
             df = df_full.select(*self.selected_columns)
             
             total_records = df.count()
-            print(f"FEEDER: {total_records} enregistrements charges")
-            print(f"FEEDER: {len(self.selected_columns)} colonnes selectionnees:")
-            for i, col in enumerate(self.selected_columns):
-                print(f"FEEDER:   {i:2d}. {col}")
+            self.logger.info(f"Loaded {total_records} records with {len(self.selected_columns)} columns")
+            
+            for i, col_name in enumerate(self.selected_columns):
+                self.logger.debug(f"  {i:2d}. {col_name}")
             
             return df
             
         except Exception as e:
-            print(f"FEEDER: ERREUR lors du chargement des donnees: {str(e)}")
+            self.logger.error(f"Error loading source data: {str(e)}")
             raise
 
     def split_dataset_incrementally(self, df):
-        print("FEEDER: Division du dataset en 3 parties incrementales")
+        """Split dataset into 3 incremental partitions for simulation.
+        
+        Args:
+            df: Source DataFrame to split
+            
+        Returns:
+            List of DataFrames representing the 3 partitions
+        """
+        self.logger.info("Splitting dataset into 3 incremental partitions")
         
         if self._partitions_cache is None:
-            print("FEEDER: Creation des partitions avec randomSplit")
+            self.logger.info("Creating partitions with randomSplit")
             
-            # Utilisation de randomSplit avec un seed fixe pour la reproductibilité
             self._partitions_cache = df.randomSplit([0.33, 0.33, 0.34], seed=42)
             
-            # Log des tailles de chaque partition
             for i, partition in enumerate(self._partitions_cache, 1):
                 count = partition.count()
-                print(f"FEEDER:   Partie {i}: {count} enregistrements")
+                self.logger.info(f"Partition {i}: {count} records")
         
         return self._partitions_cache
 
-    def create_incremental_data(self, partitions, target_date):
-        print(f"FEEDER: Creation des donnees incrementales pour {target_date}")
+    def create_incremental_data(self, partitions, target_date: str):
+        """Create incremental data based on target date and partitions.
+        
+        Args:
+            partitions: List of DataFrame partitions
+            target_date: Target date for incremental processing
+            
+        Returns:
+            DataFrame: Incremental data with ingestion_date column
+        """
+        self.logger.info(f"Creating incremental data for {target_date}")
         
         part1, part2, part3 = partitions
         
-        # Logique incrémentale glissante
         if target_date == "2025-01-01":
-            # Jour 1: seulement partie 1
             result_df = part1
-            print("FEEDER: Jour 1: Partie 1 uniquement")
+            self.logger.info("Day 1: Partition 1 only")
             
         elif target_date == "2025-01-02":
-            # Jour 2: partie 1 + partie 2 (historique + nouvelles données)
             result_df = part1.union(part2)
-            print("FEEDER: Jour 2: Partie 1 + Partie 2 (cumulatif)")
+            self.logger.info("Day 2: Partition 1 + Partition 2 (cumulative)")
             
         elif target_date == "2025-01-03":
-            # Jour 3: partie 1 + partie 2 + partie 3 (historique complet)
             result_df = part1.union(part2).union(part3)
-            print("FEEDER: Jour 3: Partie 1 + Partie 2 + Partie 3 (historique complet)")
+            self.logger.info("Day 3: Partition 1 + Partition 2 + Partition 3 (complete historical)")
             
         else:
-            print(f"FEEDER: ERREUR - Date invalide: {target_date}")
+            self.logger.error(f"Invalid target date: {target_date}")
             raise ValueError(f"Invalid target_date: {target_date}")
         
-        # Ajouter la colonne d'ingestion
         result_df = result_df.withColumn("ingestion_date", lit(target_date))
         
         record_count = result_df.count()
-        print(f"FEEDER: Total des enregistrements pour {target_date}: {record_count}")
+        self.logger.info(f"Total records for {target_date}: {record_count}")
         
         return result_df
 
-    def save_to_bronze(self, df, target_date):
-        print(f"FEEDER: Sauvegarde en Bronze Layer pour {target_date}")
+    def save_to_bronze(self, df, target_date: str) -> None:
+        """Save DataFrame to Bronze layer with date partitioning.
         
-        # Extraction de la date pour le partitioning
-        year, month, day = target_date.split("-")
-        output_path = f"{self.bronze_output_path}/{year}/{month}/{day}"
+        Args:
+            df: DataFrame to save
+            target_date: Target date for partitioning
+        """
+        self.logger.info(f"Saving to Bronze Layer for {target_date}")
         
-        print(f"FEEDER: Chemin de sortie: {output_path}")
+        output_path = get_partition_path(self.config.bronze_output_path, target_date)
+        
+        self.logger.info(f"Output path: {output_path}")
         
         try:
-            print("FEEDER: Debut de l'ecriture en mode overwrite")
-            # Sauvegarde en mode overwrite pour simulation du batch quotidien
-            df.coalesce(2) \
-              .write \
-              .mode("overwrite") \
-              .option("compression", "snappy") \
-              .parquet(output_path)
+            self.logger.info("Starting write in overwrite mode")
+
+            self.spark_manager.write_parquet(df, output_path, mode="overwrite")
             
-            print(f"FEEDER: Sauvegarde reussie dans {output_path}")
+            self.logger.info(f"Successfully saved to {output_path}")
             
-            # Affichage des métadonnées du fichier
             self._log_output_metadata(output_path)
             
         except Exception as e:
-            print(f"FEEDER: ERREUR lors de la sauvegarde Bronze: {str(e)}")
+            self.logger.error(f"Error saving to Bronze layer: {str(e)}")
             raise
 
-    def _log_output_metadata(self, output_path):
-        print("FEEDER: Verification des metadonnees de sortie")
+    def _log_output_metadata(self, output_path: str) -> None:
+        """Log output metadata for verification.
+        
+        Args:
+            output_path: Path to output directory
+        """
+        self.logger.info("Verifying output metadata")
         try:
-            # Vérification de la structure de sortie
+
             if os.path.exists(output_path):
                 parquet_files = [f for f in os.listdir(output_path) if f.endswith('.parquet')]
-                print(f"FEEDER: {len(parquet_files)} fichiers parquet crees")
+                self.logger.info(f"Created {len(parquet_files)} parquet files")
                 
-                # Taille totale approximative
-                total_size = sum(os.path.getsize(os.path.join(output_path, f)) 
+                total_size = sum(os.path.getsize(os.path.join(output_path, f))
                                for f in parquet_files)
-                print(f"FEEDER: Taille totale: {total_size / (1024*1024):.2f} MB")
+                self.logger.info(f"Total size: {total_size / (1024*1024):.2f} MB")
                 
         except Exception as e:
-            print(f"FEEDER: ATTENTION - Impossible de lire les metadonnees: {str(e)}")
+            self.logger.warning(f"Unable to read metadata: {str(e)}")
 
-    def run_feeder(self, target_date):
+    def run_feeder(self, target_date: str) -> None:
+        """Run the complete feeder process for the target date.
+        
+        Args:
+            target_date: Target date for incremental feeding
+        """
         start_time = datetime.now()
-        print(f"FEEDER: Demarrage du Bronze Feeder pour {target_date}")
+        self.logger.info(f"Starting Bronze Feeder for {target_date}")
         
         try:
-            print("FEEDER: Etape 1 - Chargement des donnees source")
-            # 1. Charger les données source
+            self.logger.info("Step 1 - Loading source data")
             source_df = self.load_source_data()
             
-            print("FEEDER: Etape 2 - Division du dataset en partitions")
-            # 2. Diviser le dataset en partitions
+            self.logger.info("Step 2 - Splitting dataset into partitions")
             partitions = self.split_dataset_incrementally(source_df)
             
-            print("FEEDER: Etape 3 - Creation des donnees incrementales")
-            # 3. Créer les données incrémentales
+            self.logger.info("Step 3 - Creating incremental data")
             incremental_df = self.create_incremental_data(partitions, target_date)
             
-            print("FEEDER: Etape 4 - Sauvegarde en Bronze")
-            # 4. Sauvegarder en Bronze
+            self.logger.info("Step 4 - Saving to Bronze layer")
             self.save_to_bronze(incremental_df, target_date)
             
-            # Calcul du temps d'exécution
-            execution_time = datetime.now() - start_time
-            print(f"FEEDER: Termine en {execution_time.total_seconds():.2f} secondes")
+            end_time = datetime.now()
+            execution_time_str = format_execution_time(start_time, end_time)
+            self.logger.info(f"Feeder completed in {execution_time_str}")
             
         except Exception as e:
-            print(f"FEEDER: ERREUR - Echec du feeder: {str(e)}")
+            self.logger.error(f"Feeder failed: {str(e)}")
             raise
         finally:
-            print("FEEDER: Arret de Spark Session")
-            self.spark.stop()
+            self.logger.info("Stopping Spark session")
+            self.spark_manager.stop_session()
 
-def main():
-    print("FEEDER: Point d'entree principal")
+def main() -> None:
+    """Main entry point for the US Accidents Feeder application."""
+    from src.utils.helpers import get_incremental_dates
+    
+    logger = get_logger(__name__)
+    logger.info("Starting US Accidents Feeder application")
+    
     parser = argparse.ArgumentParser(description='US Accidents Bronze Feeder')
-    parser.add_argument('--date', required=True, 
-                       choices=['2025-01-01', '2025-01-02', '2025-01-03'],
+    parser.add_argument('--date', required=True,
+                       choices=get_incremental_dates(),
                        help='Target date for incremental feeding')
     
     args = parser.parse_args()
-    print(f"FEEDER: Date cible: {args.date}")
+    logger.info(f"Target date: {args.date}")
     
-    # Créer et exécuter le feeder
-    feeder = USAccidentsFeeder()
-    feeder.run_feeder(args.date)
-    
-    print("FEEDER: Execution terminee")
+    try:
+
+        feeder = USAccidentsFeeder()
+        feeder.run_feeder(args.date)
+        
+        logger.info("Feeder execution completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Feeder execution failed: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
